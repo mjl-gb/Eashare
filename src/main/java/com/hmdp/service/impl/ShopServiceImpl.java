@@ -15,6 +15,7 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.ChaceClient;
 import com.hmdp.utils.RedisData;
 import com.hmdp.utils.SystemConstants;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.geo.*;
 import org.springframework.data.redis.connection.RedisGeoCommands;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -42,12 +43,37 @@ import static java.lang.Thread.sleep;
  * @author 虎哥
  * @since 2021-12-22
  */
+@Slf4j
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
     @Resource
     private StringRedisTemplate stringRedisTemplate;
     @Resource
     private ChaceClient chaceClient;
+    @Resource
+    private com.hmdp.utils.BloomFilterUtil bloomFilterUtil;
+
+    /**
+     * 应用启动时预热布隆过滤器
+     */
+    @javax.annotation.PostConstruct
+    public void initBloomFilter() {
+        try {
+            // 查询所有店铺ID
+            List<Shop> shops = list();
+            List<Long> shopIds = new ArrayList<>();
+            for (Shop shop : shops) {
+                shopIds.add(shop.getId());
+            }
+            
+            // 批量添加到布隆过滤器
+            bloomFilterUtil.addAll(shopIds);
+            log.info("布隆过滤器预热完成，共添加 {} 个店铺ID", shopIds.size());
+        } catch (Exception e) {
+            log.error("布隆过滤器预热失败", e);
+        }
+    }
+
     @Override
     public Result queryById(Long id) {
         //解决缓存穿透
@@ -208,6 +234,12 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         updateById(shop);
         //2.删除缓存
         stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+        
+        //3.如果店铺存在，确保布隆过滤器中有该ID
+        if (getById(id) != null) {
+            bloomFilterUtil.add(id);
+        }
+        
         return Result.ok();
     }
 

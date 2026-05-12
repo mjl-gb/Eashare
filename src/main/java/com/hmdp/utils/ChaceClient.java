@@ -22,9 +22,11 @@ import static com.hmdp.utils.RedisConstants.*;
 @Slf4j
 public class ChaceClient {
     private StringRedisTemplate stringRedisTemplate;
+    private BloomFilterUtil bloomFilterUtil;
 
-    public ChaceClient(StringRedisTemplate stringRedisTemplate) {
+    public ChaceClient(StringRedisTemplate stringRedisTemplate, BloomFilterUtil bloomFilterUtil) {
         this.stringRedisTemplate = stringRedisTemplate;
+        this.bloomFilterUtil = bloomFilterUtil;
     }
 
     public void set(String key, Object value, Long time, TimeUnit unit) {
@@ -41,13 +43,19 @@ public class ChaceClient {
 
     public <R,ID> R queryWithPassThrough(String keyPrefix, ID id, Class<R> type,  Long time, TimeUnit unit,Function<ID, R> dbFallback) {
         String key = keyPrefix + id;
-        //1.从Redis中查询前端缓存
-
+            
+        // 【布隆过滤器】先判断id是否可能存在
+        if (id instanceof Long && !bloomFilterUtil.mightContain((Long) id)) {
+            log.debug("布隆过滤器拦截：id={} 一定不存在", id);
+            return null;
+        }
+            
+        //1.从 Redis中查询前端缓存
         String Json = stringRedisTemplate.opsForValue().get(key);
         //2.判断缓存是否存在
         if (StrUtil.isNotBlank(Json)) {
             return JSONUtil.toBean(Json, type);
-
+    
         }
         //判断命中的是否是空值
         if (Json != null) {
@@ -62,7 +70,12 @@ public class ChaceClient {
         }
         //4.存在，写入Redis,返回
         this.set(key, r, time, unit);
-
+            
+        // 【布隆过滤器】将存在的id添加到布隆过滤器
+        if (id instanceof Long) {
+            bloomFilterUtil.add((Long) id);
+        }
+    
         return r;
     }
 
