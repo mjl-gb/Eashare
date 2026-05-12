@@ -54,4 +54,14 @@ public class VoucherController {
     public Result queryVoucherOfShop(@PathVariable("shopId") Long shopId) {
        return voucherService.queryVoucherOfShop(shopId);
     }
+
+    /**
+     * 预热秒杀库存到Redis
+     * @return 结果
+     */
+    @PostMapping("/warmup")
+    public Result warmUpSeckillStock() {
+        voucherService.warmUpSeckillStock();
+        return Result.ok("库存预热成功");
+    }
 }

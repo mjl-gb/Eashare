@@ -14,7 +14,8 @@ local stockKey = "seckill:stock:" .. voucherId
 local orderKey = "seckill:order:" .. userId
 --3.脚本业务
 --3.1.判断库存是否充足
-if (tonumber(redis.call("get", stockKey)) <= 0) then
+local stock = tonumber(redis.call("get", stockKey))
+if (stock == nil or stock <= 0) then
     --3.1.库存不足
     return 1
 end
@@ -27,8 +28,5 @@ end
 redis.call("incrby", stockKey, -1)
 --3.5.记录用户抢购
 redis.call("sadd", orderKey, userId)
---3.6发送消息到消息队列中
-local channel = "stream.orders"
-redis.call("xadd", channel, "*", "userId", userId, "voucherId", voucherId, "id", orderId)
 
 return 0;
