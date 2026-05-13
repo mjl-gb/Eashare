@@ -6,19 +6,25 @@ import com.hmdp.entity.VoucherOrder;
 import com.hmdp.service.IVoucherOrderService;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-import static com.hmdp.config.RabbitMQConfig.SECKILL_QUEUE;
+import static com.hmdp.config.RabbitMQConfig.*;
+import static com.hmdp.utils.RedisConstants.*;
 
 @Slf4j
 @Component
@@ -28,14 +34,35 @@ public class SeckillOrderConsumer {
     private IVoucherOrderService voucherOrderService;
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private RedissonClient redissonClient;
+    @Resource
+    private RabbitTemplate rabbitTemplate;
 
     private static final String MQ_HISTORY_KEY = "mq:history:seckill:";
     private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final int MAX_RETRY_COUNT = 3;
+
+    /**
+     * 回滚Lua脚本
+     */
+    private static final DefaultRedisScript<Long> ROLLBACK_SCRIPT;
+
+    static {
+        ROLLBACK_SCRIPT = new DefaultRedisScript<>();
+        ROLLBACK_SCRIPT.setLocation(new org.springframework.core.io.ClassPathResource("rollback.lua"));
+        ROLLBACK_SCRIPT.setResultType(Long.class);
+    }
 
     @RabbitListener(queues = SECKILL_QUEUE)
     public void handleSeckillOrder(Map<String, Object> message, Channel channel, Message msg) {
         long startTime = System.currentTimeMillis();
         String messageId = msg.getMessageProperties().getMessageId();
+        
+        Long userId = null;
+        Long voucherId = null;
+        Long orderId = null;
+        Integer retryCount = 0;
         
         try {
             log.info("========== 收到秒杀订单消息 ==========");
@@ -43,21 +70,68 @@ public class SeckillOrderConsumer {
             log.info("消息内容: {}", JSONUtil.toJsonStr(message));
             log.info("接收时间: {}", LocalDateTime.now().format(FORMATTER));
             
+            // 解析消息
+            userId = Long.valueOf(message.get("userId").toString());
+            voucherId = Long.valueOf(message.get("voucherId").toString());
+            orderId = Long.valueOf(message.get("id").toString());
+            retryCount = Integer.valueOf(message.get("retryCount").toString());
+            
             VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(message, new VoucherOrder(), true);
             
-            // 处理订单
-            voucherOrderService.handleVoucherOrder(voucherOrder);
+            // 1. 获取分布式锁（用户id+秒杀活动id）
+            String lockKey = "lock:seckill:" + userId + ":" + voucherId;
+            RLock lock = redissonClient.getLock(lockKey);
+            boolean isLocked = lock.tryLock();
             
-            // ACK确认
-            channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
+            if (!isLocked) {
+                log.warn("获取分布式锁失败，可能正在处理相同订单，orderId: {}", orderId);
+                channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
+                return;
+            }
             
-            long processingTime = System.currentTimeMillis() - startTime;
-            
-            // 记录成功历史到Redis
-            recordSuccessHistory(messageId, voucherOrder, processingTime);
-            
-            log.info("订单处理成功 - 订单ID: {}, 耗时: {}ms", voucherOrder.getId(), processingTime);
-            log.info("========================================");
+            try {
+                // 2. 幂等性检查1：确保当前订单表不存在对应订单
+                int orderCount = voucherOrderService.query()
+                    .eq("id", orderId)
+                    .count();
+                if (orderCount > 0) {
+                    log.info("订单已存在，重复消费，orderId: {}", orderId);
+                    channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
+                    return;
+                }
+                
+                // 3. 幂等性检查2：检查秒杀活动对应的用户Set中包含当前用户ID
+                String orderKey = SECKILL_ORDER_KEY + voucherId;
+                Boolean isMember = stringRedisTemplate.opsForSet().isMember(orderKey, userId.toString());
+                if (isMember == null || !isMember) {
+                    log.warn("用户不在已购买Set中，可能是已回滚的消息，orderId: {}", orderId);
+                    // 回滚Redis数据
+                    rollbackRedisData(voucherId, userId);
+                    setResult(orderId, voucherId, userId, "FAIL");
+                    channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
+                    return;
+                }
+                
+                // 4. 执行下单逻辑
+                voucherOrderService.handleVoucherOrder(voucherOrder);
+                
+                // 5. 成功后写入Redis成功结果
+                setResult(orderId, voucherId, userId, "SUCCESS");
+                
+                // ACK确认
+                channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
+                
+                long processingTime = System.currentTimeMillis() - startTime;
+                
+                // 记录成功历史到Redis
+                recordSuccessHistory(messageId, voucherOrder, processingTime);
+                
+                log.info("订单处理成功 - 订单ID: {}, 耗时: {}ms", voucherOrder.getId(), processingTime);
+                log.info("========================================");
+                
+            } finally {
+                lock.unlock();
+            }
             
         } catch (Exception e) {
             long processingTime = System.currentTimeMillis() - startTime;
@@ -72,9 +146,26 @@ public class SeckillOrderConsumer {
             recordFailureHistory(messageId, message, e, processingTime);
             
             try {
-                // 拒绝消息并重新入队
-                channel.basicNack(msg.getMessageProperties().getDeliveryTag(), false, true);
-                log.info("消息已重新入队");
+                // 重试超过三次，回滚Redis数据并发送到死信队列
+                if (retryCount >= MAX_RETRY_COUNT) {
+                    log.error("重试次数超过{}次，执行回滚并发送死信，orderId: {}", MAX_RETRY_COUNT, orderId);
+                    
+                    // 回滚Redis数据
+                    if (userId != null && voucherId != null) {
+                        rollbackRedisData(voucherId, userId);
+                        setResult(orderId, voucherId, userId, "FAIL");
+                    }
+                    
+                    // 发送到死信队列
+                    sendToDeadLetterQueue(message);
+                    
+                    // ACK确认，不再重试
+                    channel.basicAck(msg.getMessageProperties().getDeliveryTag(), false);
+                } else {
+                    // 拒绝消息并重新入队
+                    channel.basicNack(msg.getMessageProperties().getDeliveryTag(), false, true);
+                    log.info("消息已重新入队，retryCount: {}", retryCount + 1);
+                }
             } catch (IOException ioException) {
                 log.error("消息拒绝失败", ioException);
             }
@@ -165,6 +256,48 @@ public class SeckillOrderConsumer {
             
         } catch (Exception ex) {
             log.error("记录失败历史失败", ex);
+        }
+    }
+
+    /**
+     * 回滚Redis中的库存和用户ID
+     */
+    private void rollbackRedisData(Long voucherId, Long userId) {
+        try {
+            Long result = stringRedisTemplate.execute(
+                ROLLBACK_SCRIPT,
+                Collections.emptyList(),
+                voucherId.toString(),
+                userId.toString()
+            );
+            log.info("回滚Redis数据完成，voucherId: {}, userId: {}, result: {}", voucherId, userId, result);
+        } catch (Exception e) {
+            log.error("回滚Redis数据失败，voucherId: {}, userId: {}", voucherId, userId, e);
+        }
+    }
+
+    /**
+     * 设置秒杀结果
+     */
+    private void setResult(Long orderId, Long voucherId, Long userId, String result) {
+        try {
+            String resultKey = SECKILL_RESULT_KEY + voucherId + ":" + userId;
+            stringRedisTemplate.opsForValue().set(resultKey, result, 300, java.util.concurrent.TimeUnit.SECONDS);
+            log.info("设置秒杀结果: {}, orderId: {}", result, orderId);
+        } catch (Exception e) {
+            log.error("设置秒杀结果失败", e);
+        }
+    }
+
+    /**
+     * 发送消息到死信队列
+     */
+    private void sendToDeadLetterQueue(Map<String, Object> message) {
+        try {
+            rabbitTemplate.convertAndSend(SECKILL_DLX_EXCHANGE, SECKILL_DLX_ROUTING_KEY, message);
+            log.info("消息已发送到死信队列: {}", JSONUtil.toJsonStr(message));
+        } catch (Exception e) {
+            log.error("发送死信队列失败", e);
         }
     }
 }

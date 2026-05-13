@@ -3,6 +3,7 @@ package com.hmdp.controller;
 
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Voucher;
+import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.service.IVoucherService;
 import org.springframework.web.bind.annotation.*;
 
@@ -22,6 +23,9 @@ public class VoucherController {
 
     @Resource
     private IVoucherService voucherService;
+    
+    @Resource
+    private IVoucherOrderService voucherOrderService;
 
     /**
      * 新增普通券
@@ -63,5 +67,15 @@ public class VoucherController {
     public Result warmUpSeckillStock() {
         voucherService.warmUpSeckillStock();
         return Result.ok("库存预热成功");
+    }
+    
+    /**
+     * 查询秒杀结果（前端轮询）
+     * @param voucherId 优惠券ID
+     * @return 秒杀结果
+     */
+    @GetMapping("/result/{voucherId}")
+    public Result querySeckillResult(@PathVariable("voucherId") Long voucherId) {
+        return voucherOrderService.querySeckillResult(voucherId);
     }
 }

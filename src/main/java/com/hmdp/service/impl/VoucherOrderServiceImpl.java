@@ -30,6 +30,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static com.hmdp.config.RabbitMQConfig.*;
+import static com.hmdp.utils.RedisConstants.SECKILL_RESULT_KEY;
 
 /**
  * <p>
@@ -76,7 +77,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         try {
             //拿到当前代理对象，保证spring的事务能被代理对象执行（而不是this关键字拿到的当前VoucherOrderServiceImpl对象）
             //避免没提交事务就释放锁
-            proxy.createVoucherOrder(voucherOrder);
+            IVoucherOrderService currentProxy = (IVoucherOrderService) AopContext.currentProxy();
+            currentProxy.createVoucherOrder(voucherOrder);
         } catch (IllegalStateException e) {
             throw new RuntimeException(e);
         } finally {
@@ -85,37 +87,70 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     }
 
-    private IVoucherOrderService proxy;
+    @Override
+    public Result querySeckillResult(Long voucherId) {
+        // 获取当前用户ID
+        Long userId = UserHolder.getUser().getId();
+        
+        // 查询Redis中的秒杀结果
+        String resultKey = SECKILL_RESULT_KEY + voucherId + ":" + userId;
+        String result = stringRedisTemplate.opsForValue().get(resultKey);
+        
+        if (result == null) {
+            // 结果为空，说明还在处理中
+            return Result.ok("PROCESSING");
+        }
+        
+        // 返回结果
+        if ("SUCCESS".equals(result)) {
+            return Result.ok("SUCCESS");
+        } else if ("FAIL".equals(result)) {
+            return Result.fail("秒杀失败");
+        } else {
+            return Result.ok("PROCESSING");
+        }
+    }
+
     @Override
     public Result seckillVoucher(Long voucherId) {
         //获取用户id
         Long userId = UserHolder.getUser().getId();
         //获取订单id
         Long orderId = redisIdWorker.nextId("order");
-        //1.执行lua脚本
+        //1.执行lua脚本（传递重试次数0）
         Long r = stringRedisTemplate.execute(
                 SECKILL_SCRIPT,
                 Collections.emptyList(),
                 voucherId.toString(),
                 userId.toString(),
-                orderId.toString()
+                orderId.toString(),
+                "0"  // 首次调用，重试次数为0
         );
         //2.判断结果是否0
         if (r != 0) {
             //2.1 判断结果不为0，代表没有购买资格
-            return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+            String errorMsg;
+            switch (r.intValue()) {
+                case 1:
+                    errorMsg = "库存不足";
+                    break;
+                case 2:
+                    errorMsg = "不能重复下单";
+                    break;
+                case 4:
+                    errorMsg = "秒杀活动不存在";
+                    break;
+                case 5:
+                    errorMsg = "不在秒杀活动时间内";
+                    break;
+                default:
+                    errorMsg = "秒杀失败";
+            }
+            return Result.fail(errorMsg);
         }
         
-        //3.发送消息到RabbitMQ
-        Map<String, Object> message = new HashMap<>();
-        message.put("userId", userId);
-        message.put("voucherId", voucherId);
-        message.put("id", orderId);
+        //3.Lua脚本已将消息写入Redis待发队列，由后台线程可靠投递到RabbitMQ
         
-        rabbitTemplate.convertAndSend(SECKILL_EXCHANGE, SECKILL_ROUTING_KEY, message);
-        
-        //4.获取代理对象
-        proxy = (IVoucherOrderService) AopContext.currentProxy();
         return Result.ok(orderId);
     }
     /*@Override

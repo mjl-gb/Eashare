@@ -17,6 +17,7 @@ import javax.annotation.Resource;
 import java.util.List;
 
 import static com.hmdp.utils.RedisConstants.SECKILL_STOCK_KEY;
+import static com.hmdp.utils.RedisConstants.SECKILL_ACTIVITY_KEY;
 
 /**
  * <p>
@@ -77,11 +78,22 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         // 1.查询所有秒杀优惠券
         List<SeckillVoucher> seckillVouchers = seckillVoucherService.list();
         
-        // 2.将库存预热到Redis
+        // 2.将库存和活动时间预热到Redis
         for (SeckillVoucher seckillVoucher : seckillVouchers) {
-            String key = SECKILL_STOCK_KEY + seckillVoucher.getVoucherId();
-            stringRedisTemplate.opsForValue().set(key, seckillVoucher.getStock().toString());
-            log.info("预热秒杀库存到Redis，voucherId: {}, stock: {}", seckillVoucher.getVoucherId(), seckillVoucher.getStock());
+            // 预热库存
+            String stockKey = SECKILL_STOCK_KEY + seckillVoucher.getVoucherId();
+            stringRedisTemplate.opsForValue().set(stockKey, seckillVoucher.getStock().toString());
+            
+            // 预热活动信息到Hash
+            String activityKey = SECKILL_ACTIVITY_KEY + seckillVoucher.getVoucherId();
+            stringRedisTemplate.opsForHash().put(activityKey, "beginTime", 
+                String.valueOf(seckillVoucher.getBeginTime().toEpochSecond(java.time.ZoneOffset.UTC)));
+            stringRedisTemplate.opsForHash().put(activityKey, "endTime", 
+                String.valueOf(seckillVoucher.getEndTime().toEpochSecond(java.time.ZoneOffset.UTC)));
+            
+            log.info("预热秒杀库存到Redis，voucherId: {}, stock: {}, beginTime: {}, endTime: {}", 
+                seckillVoucher.getVoucherId(), seckillVoucher.getStock(), 
+                seckillVoucher.getBeginTime(), seckillVoucher.getEndTime());
         }
         
         log.info("秒杀库存预热完成，共预热 {} 个秒杀券", seckillVouchers.size());
