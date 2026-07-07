@@ -23,7 +23,7 @@ import java.util.stream.Collectors;
 import static com.eashare.utils.RedisConstants.CACHE_SHOP_KEY;
 
 @SpringBootTest
-class HmDianPingApplicationTests {
+class EashareTests {
     @Resource
     private ShopServiceImpl shopService;
     @Resource

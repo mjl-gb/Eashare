@@ -3,7 +3,8 @@ target/
 !.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
-
+# 本地敏感配置
+/config/
 ### STS ###
 .apt_generated
 .classpath
