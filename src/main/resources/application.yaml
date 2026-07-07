@@ -36,3 +36,10 @@ mybatis-plus:
 logging:
   level:
     com.hmdp: debug
+# Canal 配置
+canal:
+  server:
+    host: 127.0.0.1
+    port: 11111
+  destination: example
+  filter: heimadianping\\..*
